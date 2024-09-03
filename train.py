@@ -1,26 +1,15 @@
 # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
-import time
 import os
-import math
 import argparse
 from glob import glob
 from collections import OrderedDict
-
 import random
-import warnings
-from datetime import datetime
 import pandas as pd
-
-from sklearn.externals import joblib
-
-import numpy as np
+import joblib
 from tqdm import tqdm
-
 from sklearn.model_selection import train_test_split
-from skimage.io import imread
-from Dropout_arch import *
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,11 +24,13 @@ from torchvision import datasets, models, transforms
 from dataset import Dataset
 
 import archs
-from metrics import dice_coef, batch_iou, mean_iou, iou_score, Recall_suspect, Precision_certain
+from metrics import iou_score, Recall_suspect_, Precision_certain_
 import losses
 from utils import str2bool, count_params
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+from Dropoutblock import DropBlock_search
+
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 arch_names = list(archs.__dict__.keys())
 loss_names = list(losses.__dict__.keys())
@@ -51,7 +42,7 @@ def parse_args():
 
     parser.add_argument('--name', default=None,
                         help='model name: (default: arch+timestamp)')
-    parser.add_argument('--arch', '-a', metavar='ARCH', default='Bayesian_SegNet',
+    parser.add_argument('--arch', '-a', metavar='ARCH', default='BayesUNet_spatial',
                         choices=arch_names,
                         help='model architecture: ' +
                             ' | '.join(arch_names) +
@@ -69,12 +60,12 @@ def parse_args():
     parser.add_argument('--mask-ext', default='bmp',
                         help='mask file extension')
     parser.add_argument('--aug', default=False, type=str2bool)
-    parser.add_argument('--loss', default='BCEDiceLoss_splite',
+    parser.add_argument('--loss', default='BCEDiceLoss_weight',
                         choices=loss_names,
                         help='loss: ' +
                             ' | '.join(loss_names) +
                             ' (default: BCEDiceLoss)')
-    parser.add_argument('--epochs', default=1000
+    parser.add_argument('--epochs', default=500
                         , type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--early-stop', default=20, type=int,
@@ -91,7 +82,7 @@ def parse_args():
                         metavar='LR', help='initial learning rate')
     parser.add_argument('--momentum', default=0.9, type=float,
                         help='momentum')
-    parser.add_argument('--weight-decay', default=1e-4, type=float,
+    parser.add_argument('--weight-decay', default=1e-5, type=float,
                         help='weight decay')
     parser.add_argument('--nesterov', default=False, type=str2bool,
                         help='nesterov')
@@ -118,94 +109,76 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def train(args, train_loader, model, model_score, criterion, optimizer, optimizer_score, epoch, scheduler=None):
+def train(args, train_loader, model, criterion, criterion_val, optimizer, epoch, device):
     losses = AverageMeter()
     ious = AverageMeter()
 
     model.train()
-    model_score.train()
     torch.autograd.set_detect_anomaly(True)
-    criterion_score = torch.nn.MSELoss()
-    #print(len(train_loader))
 
     for i, (input, target) in tqdm(enumerate(train_loader), total=len(train_loader)):
-        # print(input.size)
-        # print(target.size)
-        input = input.cuda()
-        target = target.cuda()
-        # compute output
+        input = input.to(device)
+        target = target.to(device)
         if args.deepsupervision:
             outputs = model(input)
-            loss = 0
-            for output in outputs:
-                loss += criterion(output, target)
+            n = 4
+            output_sum = []
+            outputs_sum = []
+            for i in range(len(outputs)):
+                output_sum.append(outputs[i].unsqueeze(0))
+            for j in range(n-1):
+                outputs_new = model(input)
+                ji = 0
+                for output_new in outputs_new:
+                    outputs_sum.append(torch.cat((output_sum[ji],output_new.unsqueeze(0)), 0))
+                    ji += 1
+                output_sum.clear()
+                output_sum.extend(outputs_sum)
+                outputs_sum.clear()
+            output = output_sum[0]
+            output_var = torch.var(output, dim=0)
+            var = output_var[0]
+            var_normals = ((var - torch.min(var)) / (torch.max(var) - torch.min(var))).unsqueeze(0)
+            for ii in range(1, n):
+                var = output_var[ii]
+                var_normal = ((var - torch.min(var)) / (torch.max(var) - torch.min(var))).unsqueeze(0)
+                var_normals = torch.cat(((var_normals, var_normal)), 0)
+            loss = criterion(output[0], target, var_normals)
+            for jj in range(len(output_sum)-1):
+                aaaa = torch.mean(output_sum[jj+1], dim=0)
+                loss += criterion_val(aaaa, target)
             loss /= len(outputs)
-            iou = iou_score(outputs[-1], target)
-            # iou = mean_iou(outputs[-1], target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            iou = iou_score(torch.mean(outputs[0], dim=0), target)
+
         else:
             n = 4
             output = model(input)
-            # loss = criterion(output, target)
-            # iou = mean_iou(output, target)
-            # iou = iou_score(output, target)
-            loss_ = criterion(output, target).unsqueeze(1)
+            outputs = output.unsqueeze(0)
             for i in range(n-1):
                 output = model(input)
-                loss_ = torch.cat((loss_, criterion(output, target).unsqueeze(1)), 1)
-                # print(loss_)
-            loss_var = torch.var(loss_, dim=1)
-            # print(loss_var)
-            # loss_var_guiyi = loss_var/loss_var.sum()
-            # print('loss_var',loss_var)
-            # loss_var_softmax = F.softmax(torch.tanh(loss_var))
+                outputs = torch.cat((outputs, output.unsqueeze(0)),0)
+            output_var = torch.var(outputs, dim=0)
+            output_mean = torch.mean(outputs, dim=0)
+            var = output_var[0]
+            var_normals = ((var - torch.min(var)) / (torch.max(var) - torch.min(var))).unsqueeze(0)
+            for ii in range(1, n):
+                var = output_var[ii]
+                var_normal = ((var - torch.min(var)) / (torch.max(var) - torch.min(var))).unsqueeze(0)
+                var_normals = torch.cat(((var_normals, var_normal)), 0)
 
-            # print('loss_var:', loss_var)
-            loss_mean = torch.mean(loss_, dim=1)
-            input_score = torch.cat((input, target), 1)
-            score = model_score(input_score)
-            # print('score', score)
-            loss = score * loss_mean
-            loss = torch.sum(loss)
-            # loss = torch.mean(loss)
-            # print('loss', loss)
+            index = random.randint(0,3)
+            loss = criterion(outputs[index], target, var_normals)
+            iou = iou_score(output_mean, target)
 
             optimizer.zero_grad()
-            loss.backward(retain_graph=True)
-
-
-            # loss_var_normal = (loss_var - torch.min(loss_var)) / (torch.max(loss_var) - torch.min(loss_var))
-            # score_normal = (score - torch.min(score)) / (torch.max(score) - torch.min(score))
-            # score_dim = torch.max(score.squeeze(-1), 0)
-            # loss_score = criterion_score( loss_var * 100, score )
-            # loss_score = criterion_score(score, 1-loss_var*10)
-            loss_var_guiyi = (torch.max(loss_var) - loss_var)/(torch.max(loss_var) - torch.min(loss_var))
-            # print(loss_var_guiyi)
-            # loss_var_ = 1-torch.sigmoid(loss_var*100)
-            loss_var_softmax = F.softmax(1-loss_var_guiyi)
-            # print(loss_var_softmax)
-            # loss_score = criterion_score(score, loss_var_softmax)
-            loss_score = F.binary_cross_entropy_with_logits(score, loss_var_softmax)
-            # print('loss_score', loss_score)
-            # loss_score_final = loss_score + loss
-            loss_score_final = loss
-
-            optimizer_score.zero_grad()
-
-
-            loss_score_final.backward()
+            loss.backward()
             optimizer.step()
-            optimizer_score.step()
-
-            iou = iou_score(output, target)
-            # iou = iou_score(output, target)
 
         losses.update(loss.item(), input.size(0))
         ious.update(iou, input.size(0))
-
-        # compute gradient and do optimizing step
-        # optimizer_score.zero_grad()
-        # loss.backward()
-        # optimizer_score.step()
 
     log = OrderedDict([
         ('loss', losses.avg),
@@ -215,21 +188,18 @@ def train(args, train_loader, model, model_score, criterion, optimizer, optimize
     return log
 
 
-def validate(args, val_loader, model,model_score, criterion):
-    losses = AverageMeter()
-    ious = AverageMeter()
+def validate(args, val_loader, model, criterion):
     new_losses = AverageMeter()
     new_ious = AverageMeter()
     Ps = AverageMeter()
     Rs = AverageMeter()
 
     def apply_dropout(m):
-        if type(m) == nn.Dropout or type(m) == nn.Dropout2d or type(m) == DropBlock2D:
+        if type(m) == DropBlock_search:
             m.train()
 
     # switch to evaluate mode
     model.eval()
-    model_score.eval()
     model.apply(apply_dropout)
 
     with torch.no_grad():
@@ -237,12 +207,6 @@ def validate(args, val_loader, model,model_score, criterion):
             input = input.cuda()
             target = target.cuda()
 
-            n = 16
-            loss = 0
-            iou = 0
-
-            output_bayes = np.zeros(target.size())
-            output_bayes_int = np.zeros(target.size())
             inputs = input
             for k in range(3):
                 inputs = torch.cat((inputs, input))
@@ -250,64 +214,19 @@ def validate(args, val_loader, model,model_score, criterion):
             for kk in range(3):
                 output_, features = model(inputs)
                 outputs = torch.cat((outputs, output_))
-            for kkk in range(2):
-                inputs = torch.cat((inputs, inputs))
-            # outputs, _ = model(inputs)
-            outputs_score = torch.cat((inputs, outputs), 1)
-            scores = model_score(outputs_score)
-            # print(scores)
-            results = outputs[0, :, :, :] * (scores[0, :, :].unsqueeze(0))
-            for ii in range(n - 1):
-                results = torch.cat(
-                    (results, outputs[ii + 1, :, :, :] * (scores[ii + 1, :, :].unsqueeze(0))), 0)
-            # results = torch.sigmoid(results)
-            result = torch.sum(results, dim=0)
-            result = result.unsqueeze(0).unsqueeze(0)
+            results = outputs
+            result = torch.mean(results, dim=0)
+            result = result.unsqueeze(0)
             iou_new = iou_score(result, target)
+            recall = Recall_suspect_(results, target)
+            precision = Precision_certain_(results, target)
             loss_new = criterion(result, target)
-            # print('new_iou', iou)
-            # print('new_loss', loss)
-
-
-            for l in range(n):
-                output = outputs[l,:,:,:].unsqueeze(0)
-                # loss_a = criterion(output, target)
-                loss_ = criterion(output, target)
-                # input_score = torch.cat((input, output), 1)
-                # score = model_score(input_score)
-                # print('score', score)
-                loss = loss_
-
-                # loss = torch.tanh(score) * loss_
-                loss_a = torch.mean(loss)
-                iou_a = iou_score(output, target)
-
-                # iou_a = iou_score(outputs[l,:,:,:].unsqueeze(0), target)
-                loss += loss_a
-                iou += iou_a
-            loss = loss/n
-            iou = iou/n
-            for l in range(n):
-                output = outputs[l, :, :, :].unsqueeze(0)
-                output_mat = torch.sigmoid(output).data.cpu().numpy()
-                output_int = output_mat > 0.5
-                output_bayes += output_mat  # * (1 / n)
-                output_bayes_int += output_int
-
-            certain = output_bayes_int >= 16
-            P = Precision_certain(certain, target)
-            suspect = output_bayes_int >= 1
-            R = Recall_suspect(suspect, target)
-            losses.update(loss.item(), input.size(0))
-            ious.update(iou, input.size(0))
             new_losses.update(loss_new.item(), input.size(0))
-            new_ious.update(iou_new.item(), input.size(0))
-            Ps.update(P, input.size(0))
-            Rs.update(R, input.size(0))
+            new_ious.update(iou_new, input.size(0))
+            Ps.update(precision, input.size(0))
+            Rs.update(recall, input.size(0))
 
     log = OrderedDict([
-        ('loss', losses.avg),
-        ('iou', ious.avg),
         ('P', Ps.avg),
         ('R', Rs.avg),
         ('new_losses', new_losses.avg),
@@ -318,13 +237,14 @@ def validate(args, val_loader, model,model_score, criterion):
 
 
 def main():
+    device = torch.device('cuda:0')
     args = parse_args()
 
     if args.name is None:
         if args.deepsupervision:
             args.name = '%s_%s_wDS' %(args.dataset, args.arch)
         else:
-            args.name = '%s_%s_woDS_newnewlossdropout' %(args.dataset, args.arch)
+            args.name = '%s_%s_woDS' %(args.dataset, args.arch)
     if not os.path.exists('models/%s' %args.name):
         os.makedirs('models/%s' %args.name)
 
@@ -341,46 +261,40 @@ def main():
 
     # define loss function (criterion)
     if args.loss == 'BCEWithLogitsLoss':
-        criterion = nn.BCEWithLogitsLoss().cuda()
+        criterion = nn.BCEWithLogitsLoss().to(device)
     else:
-        criterion = losses.__dict__[args.loss]().cuda()
+        criterion = losses.__dict__[args.loss]().to(device)
+        criterion_val = losses.BCEDiceLoss().to(device)
 
     cudnn.benchmark = True
 
-    # Data loading code
     img_paths = glob('input/' + args.dataset + '/images/*')
-    mask_paths = glob('input/' + args.dataset + '/masks/*')
 
+
+    mask_paths = glob('input/' + args.dataset + '/masks/*')
+    #
     train_img_paths, val_img_paths, train_mask_paths, val_mask_paths = \
         train_test_split(img_paths, mask_paths, test_size=0.2, random_state=41)
+
 
     # create model
     print("=> creating model %s" %args.arch)
     model = archs.__dict__[args.arch](args)
 
-    model_score = archs.Score(args)
-
-    model = model.cuda()
-    model_score = model_score.cuda()
+    model = model.to(device)
 
     print(count_params(model))
 
     if args.optimizer == 'Adam':
-        optimizer = optim.Adam([{'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr':args.lr},
-        {'params':filter(lambda p: p.requires_grad, model_score.parameters()), 'lr':args.lr}
+        optimizer = optim.Adam([{'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr':args.lr}
                                 ])
-        optimizer_score = optim.Adam([
-            # {'params': filter(lambda p: p.requires_grad, model.parameters()), 'lr':args.lr},
-            {'params':filter(lambda p: p.requires_grad, model_score.parameters()), 'lr':args.lr}
-                                ])
+
     elif args.optimizer == 'SGD':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr,
             momentum=args.momentum, weight_decay=args.weight_decay, nesterov=args.nesterov)
 
     train_dataset = Dataset(args, train_img_paths, train_mask_paths, args.aug)
-    #print(train_dataset[0])
     val_dataset = Dataset(args, val_img_paths, val_mask_paths)
-    #print(val_dataset[0])
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -401,48 +315,50 @@ def main():
     ])
 
     best_iou = 0
-    best_P = 0
-    best_R = 0
+    # best_P = 0
+    # best_R = 0
     trigger = 0
     for epoch in range(args.epochs):
         print('Epoch [%d/%d]' %(epoch, args.epochs))
 
         # train for one epoch
-        train_log = train(args, train_loader, model, model_score, criterion, optimizer, optimizer_score, epoch)
+        train_log = train(args, train_loader, model,  criterion, criterion_val, optimizer,  epoch, device)
         # evaluate on validation set
-        val_log = validate(args, val_loader, model, model_score, criterion)
+        val_log = validate(args, val_loader, model,  criterion_val)
 
-        print('loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f - best_val_iou %.4f - val_new_loss %.4f - val_new_iou %.4f'
-            %(train_log['loss'], train_log['iou'], val_log['loss'], val_log['iou'], best_iou, val_log['new_losses'], val_log['new_ious']))
 
         tmp = pd.Series([
             epoch,
             args.lr,
             train_log['loss'],
             train_log['iou'],
-            val_log['loss'],
-            val_log['iou'],
+            val_log['new_losses'],
+            val_log['new_ious'],
         ], index=['epoch', 'lr', 'loss', 'iou', 'val_loss', 'val_iou'])
 
         log = log.append(tmp, ignore_index=True)
         log.to_csv('models/%s/log.csv' %args.name, index=False)
 
         trigger += 1
-        torch.save({'model': model.state_dict(), 'model_score': model_score.state_dict()}, 'models/%s/model_latest.pth' %args.name)
+        torch.save({'model': model.state_dict()}, 'models/%s/model_latest.pth' %args.name)
 
         if val_log['new_ious'] > best_iou:
-            torch.save({'model': model.state_dict(), 'model_score': model_score.state_dict()}, 'models/%s/model.pth' %args.name)
+            torch.save({'model': model.state_dict()}, 'models/%s/model.pth' %args.name)
             best_iou = val_log['new_ious']
-            best_P = val_log['P']
-            best_R = val_log['R']
+            # best_P = val_log['P']
+            # best_R = val_log['R']
             print("=> saved best model")
             trigger = 0
-
-        # early stopping
-        # if not args.early_stop is None:
-        #    if trigger >= args.early_stop:
-        #        print("=> early stopping")
-        #        break
+        print('loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f - best_val_iou %.4f'
+            %(train_log['loss'], train_log['iou'], val_log['new_losses'], val_log['new_ious'], best_iou))
+        with open('models/%s/Iou_train.txt' % args.name, 'w') as f:
+            f.write('%d %.4f\n' % (epoch, train_log['iou']))
+        with open('models/%s/Iou_test.txt' % args.name, 'w') as f:
+            f.write('%d %.4f\t%.4f\t%.4f\n' % (epoch, val_log['new_ious'], val_log['R'], val_log['P']))
+        with open('models/%s/Loss_train.txt' % args.name, 'w') as f:
+            f.write('%d %.4f\n' % (epoch, train_log['loss']))
+        with open('models/%s/Loss_test.txt' % args.name, 'w') as f:
+            f.write('%d %.4f\n' % (epoch, val_log['new_losses']))
 
         torch.cuda.empty_cache()
 
